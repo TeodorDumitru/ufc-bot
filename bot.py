@@ -1,207 +1,134 @@
-"""
-Discord bot that posts once per week about the next UFC event.
-
-Features
-- Scrapes UFCStats to find the next upcoming UFC event and its fight card
-- Posts a compact summary: event name, date/time, location, and bouts (fighter vs. fighter + weight class)
-- Runs on a weekly schedule (default: Fridays at 12:00 Europe/Copenhagen)
-
-Env vars required
-- DISCORD_TOKEN: your bot token
-- DISCORD_CHANNEL_ID: channel ID to post into (integer)
-
-Install
-  pip install -r requirements.txt
-Run
-  python bot.py
-
-Notes
-- Parsing relies on UFCStats markup and may break if the site changes.
-- Be respectful of the site; this script fetches only two pages per run.
-"""
-
 import os
 import asyncio
 import logging
-from datetime import datetime
-
-import pytz
+from datetime import datetime, timezone, timedelta
 import aiohttp
-from bs4 import BeautifulSoup
+import pytz
+import icalendar
 import discord
-from discord.ext import tasks
+from discord.ext import commands
 
-# --------------------- Config ---------------------
-TZ = pytz.timezone("Europe/Copenhagen")
-POST_WEEKDAY = 4  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
-POST_HOUR = 12
-POST_MINUTE = 0
+# ── Config ────────────────────────────────────────────────────────────────────
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 
-UFCSTATS_UPCOMING = "https://ufcstats.com/statistics/events/upcoming"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+# Saturday noon Copenhagen by default (most UFC cards are Sat)
+POST_WEEKDAY = int(os.getenv("POST_WEEKDAY", "5"))  # 0=Mon … 6=Sun
+POST_HOUR = int(os.getenv("POST_HOUR", "12"))
+POST_MINUTE = int(os.getenv("POST_MINUTE", "0"))
+TZ = pytz.timezone(os.getenv("TZ", "Europe/Copenhagen"))
 
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "0"))
+UFC_ICS_URL = "https://raw.githubusercontent.com/clarencechaan/ufc-cal/ics/UFC.ics"
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
-logger = logging.getLogger("ufc-weekly-bot")
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("ufc-bot")
 
-# --------------------- Scraper ---------------------
-async def fetch(session: aiohttp.ClientSession, url: str) -> str:
-    async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=20)) as r:
-        r.raise_for_status()
-        return await r.text()
-
-async def get_next_event(session: aiohttp.ClientSession):
-    """Return dict with {title, date, location, url} for the next event."""
-    html = await fetch(session, UFCSTATS_UPCOMING)
-    soup = BeautifulSoup(html, "lxml")
-
-    # The upcoming events table lists rows with event link + date + location.
-    # We pick the first row.
-    table = soup.select_one("table.b-statistics__table-events")
-    if not table:
-        raise RuntimeError("Could not locate upcoming events table on UFCStats.")
-
-    first_row = table.select_one("tbody tr")
-    if not first_row:
-        raise RuntimeError("No upcoming event rows found.")
-
-    a = first_row.select_one("a")
-    date_cell = first_row.select_one("td:nth-of-type(2)")
-    loc_cell = first_row.select_one("td:nth-of-type(3)")
-
-    title = a.get_text(strip=True) if a else "UFC Event"
-    url = a["href"] if a and a.has_attr("href") else None
-    date_text = date_cell.get_text(strip=True) if date_cell else ""
-    location = loc_cell.get_text(strip=True) if loc_cell else ""
-
-    return {
-        "title": title,
-        "date_text": date_text,
-        "location": location,
-        "url": url,
-    }
-
-async def get_fight_card(session: aiohttp.ClientSession, event_url: str):
-    """Parse event page and return list of fights: [{weight, red, blue}] in card order.
-    UFCStats lists cards top-to-bottom; we keep that order.
-    """
-    if not event_url:
-        return []
-    html = await fetch(session, event_url)
-    soup = BeautifulSoup(html, "lxml")
-
-    fights = []
-    # Each fight is in a tr with class b-fight-details__table-row
-    for row in soup.select("tr.b-fight-details__table-row.b-fight-details__table-row__hover.js-fight-details-click"):
-        # Weight class is in the first td with class b-fight-details__table-col"
-        weight_td = row.select_one("td.b-fight-details__table-col:nth-of-type(1)")
-        weight = weight_td.get_text(strip=True) if weight_td else ""
-
-        # Fighters are nested inside two "b-fight-details__person" blocks or links in the 2nd/3rd columns.
-        names = [a.get_text(strip=True) for a in row.select("a.b-link.b-link_style_black")]
-        # Deduplicate while preserving order (each fight lists each fighter multiple times in the row)
-        seen = set()
-        fighters = []
-        for n in names:
-            if n and n not in seen:
-                fighters.append(n)
-                seen.add(n)
-        if len(fighters) >= 2:
-            red, blue = fighters[0], fighters[1]
-            fights.append({"weight": weight, "red": red, "blue": blue})
-
-    # Fallback in case the selector set above misses (markup changes):
-    if not fights:
-        for bout in soup.select("div.b-fight-details__fight"):
-            weight = bout.select_one("i.b-fight-details__fight-title")
-            weight = weight.get_text(strip=True) if weight else ""
-            persons = [p.get_text(strip=True) for p in bout.select("div.b-fight-details__person a")]
-            if len(persons) >= 2:
-                fights.append({"weight": weight, "red": persons[0], "blue": persons[1]})
-
-    return fights
-
-# --------------------- Formatting ---------------------
-
-def format_message(event: dict, fights: list) -> str:
-    title = event.get("title", "Upcoming UFC Event")
-    date_text = event.get("date_text", "TBA")
-    location = event.get("location", "TBA")
-    url = event.get("url") or UFCSTATS_UPCOMING
-
-    header = f"**{title}**\n📅 {date_text}  •  📍 {location}\n🔗 More: {url}\n\n**Fight Card**"
-
-    # Keep it concise: show up to 8 fights.
-    lines = []
-    for fight in fights[:8]:
-        w = fight.get("weight", "")
-        if w:
-            lines.append(f"• {fight['red']} vs {fight['blue']}  —  *{w}*")
-        else:
-            lines.append(f"• {fight['red']} vs {fight['blue']}")
-
-    if len(fights) > 8:
-        lines.append(f"…and {len(fights) - 8} more bouts")
-
-    return header + "\n" + "\n".join(lines)
-
-# --------------------- Discord Bot ---------------------
-
+# ── Discord ───────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-async def post_update():
-    if CHANNEL_ID == 0:
-        logger.error("DISCORD_CHANNEL_ID not configured.")
-        return
-
+# ── Fetch and parse ICS ───────────────────────────────────────────────────────
+async def fetch_ics_events():
     async with aiohttp.ClientSession() as session:
-        try:
-            event = await get_next_event(session)
-            fights = await get_fight_card(session, event.get("url"))
-            msg = format_message(event, fights)
-        except Exception as e:
-            logger.exception("Failed to build UFC update: %s", e)
-            msg = (
-                "Couldn't fetch the next UFC event right now. "
-                "(The source might have changed.)"
-            )
+        resp = await session.get(UFC_ICS_URL)
+        resp.raise_for_status()
+        data = await resp.read()
 
-    channel = client.get_channel(CHANNEL_ID)
-    if not channel:
-        logger.error("Channel %s not found (check bot permissions and ID).", CHANNEL_ID)
+    cal = icalendar.Calendar.from_ical(data)
+    events = []
+    now = datetime.now(timezone.utc)
+
+    for comp in cal.walk("VEVENT"):
+        dt = comp.get("DTSTART").dt
+        if isinstance(dt, datetime) and dt > now:
+            events.append({
+                "summary": str(comp.get("SUMMARY")),
+                "start": dt,
+                "description": str(comp.get("DESCRIPTION") or ""),
+                "location": str(comp.get("LOCATION") or ""),
+                "url": str(comp.get("UID") or ""),
+            })
+
+    events.sort(key=lambda e: e["start"])
+    return events
+
+def format_event(event):
+    start_local = event["start"].astimezone(TZ)
+    header = (
+        f"**{event['summary']}**\n"
+        f"📅 {start_local.strftime('%Y-%m-%d %H:%M %Z')}\n"
+    )
+    desc_lines = [line.strip() for line in event["description"].splitlines() if line.strip()]
+    body = "\n".join(desc_lines)
+    footer = ""
+    if event.get("location"):
+        footer += f"\n📍 {event['location']}"
+    if event.get("url"):
+        footer += f"\n🔗 {event['url']}"
+    return header + body + footer
+
+async def get_next_event():
+    events = await fetch_ics_events()
+    return events[0] if events else None
+
+async def post_next_event(channel: discord.TextChannel):
+    evt = await get_next_event()
+    if not evt:
+        await channel.send("Couldn’t find an upcoming UFC event right now.")
         return
-    await channel.send(msg)
+    await channel.send(format_event(evt))
 
-@tasks.loop(minutes=1)
-async def scheduler_loop():
-    now = datetime.now(TZ)
-    if (
-        now.weekday() == POST_WEEKDAY and
-        now.hour == POST_HOUR and
-        now.minute == POST_MINUTE
-    ):
-        logger.info("Scheduled time reached — posting UFC update…")
-        await post_update()
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+def next_run_time(now: datetime) -> datetime:
+    local_now = now.astimezone(TZ)
+    target = local_now.replace(hour=POST_HOUR, minute=POST_MINUTE, second=0, microsecond=0)
+    days_ahead = (POST_WEEKDAY - target.weekday()) % 7
+    if days_ahead == 0 and target <= local_now:
+        days_ahead = 7
+    return target + timedelta(days=days_ahead)
 
-@client.event
+async def scheduler():
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        log.error("Channel ID %s not found or not a text channel.", CHANNEL_ID)
+        return
+    while not bot.is_closed():
+        now = datetime.now(TZ)
+        run_at = next_run_time(now)
+        wait_s = max(1.0, (run_at - now).total_seconds())
+        log.info("Next scheduled post at %s (%.0fs)", run_at.isoformat(), wait_s)
+        try:
+            await asyncio.sleep(wait_s)
+        except asyncio.CancelledError:
+            break
+        try:
+            await post_next_event(channel)
+        except Exception as e:
+            log.exception("Error posting scheduled UFC event: %s", e)
+        await asyncio.sleep(5)
+
+@bot.event
 async def on_ready():
-    logger.info("Logged in as %s (id=%s)", client.user, client.user.id)
-    if not scheduler_loop.is_running():
-        scheduler_loop.start()
-        logger.info(
-            "Scheduler started. Will post on weekday=%d at %02d:%02d %s",
-            POST_WEEKDAY, POST_HOUR, POST_MINUTE, TZ.zone,
-        )
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    if not any(t.get_name() == "ufc-scheduler" for t in asyncio.all_tasks()):
+        asyncio.create_task(scheduler(), name="ufc-scheduler")
 
+# ── Manual trigger: !ufc ──────────────────────────────────────────────────────
+@bot.command(name="ufc", help="Post the next UFC event now.")
+async def ufc_cmd(ctx: commands.Context):
+    if ctx.channel.id != CHANNEL_ID:
+        await ctx.send("This command is disabled in this channel.")
+        return
+    try:
+        async with ctx.typing():
+            await post_next_event(ctx.channel)
+    except Exception as e:
+        log.exception("Command error: %s", e)
+        await ctx.send("Sorry, couldn’t fetch the event right now.")
+
+# ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise SystemExit("Set DISCORD_TOKEN env var with your bot token.")
-    if CHANNEL_ID == 0:
-        logger.warning("DISCORD_CHANNEL_ID is not set — the bot will log but not post.")
-    client.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
