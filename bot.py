@@ -7,6 +7,8 @@ import pytz
 import icalendar
 import discord
 from discord.ext import commands
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -28,6 +30,20 @@ log = logging.getLogger("ufc-bot")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ── Keep Alive ────────────────────────────────────────────────────────────────
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_keepalive_server():
+    server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), KeepAliveHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_keepalive_server, daemon=True).start()
 
 # ── Fetch and parse ICS ───────────────────────────────────────────────────────
 async def fetch_ics_events():
